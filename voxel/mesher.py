@@ -61,7 +61,25 @@ def cull_hidden(
       相邻的空气体素同样不能遮挡实心体素的面。
     * 返回列表按元组字典序排序，保证结果与字典插入顺序无关。
     """
-    raise NotImplementedError
+
+    def solid(pos: tuple[int, int, int]) -> bool:
+        if pos in blocks:
+            return blocks[pos] != 0
+        return neighbors.get(pos, 0) != 0
+
+    faces: list[tuple[int, int, int, int, int, int]] = []
+    for pos, material in blocks.items():
+        if material == 0:
+            continue
+        x, y, z = pos
+        for axis in range(3):
+            for sign in (1, -1):
+                npos = [x, y, z]
+                npos[axis] += sign
+                if not solid((npos[0], npos[1], npos[2])):
+                    faces.append((x, y, z, axis, sign, material))
+    faces.sort()
+    return faces
 
 
 def greedy_merge(
@@ -96,7 +114,47 @@ def greedy_merge(
     合并结果必须无重叠地覆盖全部输入面，所有 ``area`` 之和等于输入面数；
     返回列表按 ``(axis, sign, material, origin)`` 字典序排序。
     """
-    raise NotImplementedError
+    t1 = (axis + 1) % 3
+    t2 = (axis + 2) % 3
+
+    groups: dict[tuple[int, int, int], set[tuple[int, int]]] = {}
+    for face in faces:
+        if face[3] != axis:
+            continue
+        coord = (face[0], face[1], face[2])
+        key = (face[4], face[5], coord[axis])
+        groups.setdefault(key, set()).add((coord[t1], coord[t2]))
+
+    rects: list[dict] = []
+    for (sign, material, acoord), cells in groups.items():
+        remaining = set(cells)
+        while remaining:
+            a0, b0 = min(remaining)
+            n1 = 1
+            while (a0 + n1, b0) in remaining:
+                n1 += 1
+            n2 = 1
+            while all((a0 + i, b0 + n2) in remaining for i in range(n1)):
+                n2 += 1
+            for i in range(n1):
+                for j in range(n2):
+                    remaining.discard((a0 + i, b0 + j))
+            origin = [0, 0, 0]
+            origin[axis] = acoord
+            origin[t1] = a0
+            origin[t2] = b0
+            rects.append(
+                {
+                    "axis": axis,
+                    "sign": sign,
+                    "material": material,
+                    "origin": (origin[0], origin[1], origin[2]),
+                    "extent": (n1, n2),
+                    "area": n1 * n2,
+                }
+            )
+    rects.sort(key=lambda r: (r["axis"], r["sign"], r["material"], r["origin"]))
+    return rects
 
 
 def build_vertices(faces: Iterable[Mapping[str, object]]) -> dict:
@@ -128,7 +186,48 @@ def build_vertices(faces: Iterable[Mapping[str, object]]) -> dict:
 
     ``faces`` 为空时返回五个空列表/0 组成的空网格。
     """
-    raise NotImplementedError
+    vertices: list[tuple[int, int, int]] = []
+    normals: list[tuple[float, float, float]] = []
+    indices: list[int] = []
+    materials: list[int] = []
+
+    for rect in faces:
+        axis = rect["axis"]
+        sign = rect["sign"]
+        n1, n2 = rect["extent"]
+        t1 = (axis + 1) % 3
+        t2 = (axis + 2) % 3
+
+        base = list(rect["origin"])
+        if sign == 1:
+            base[axis] += 1
+
+        def corner(a: int, b: int) -> tuple[int, int, int]:
+            p = list(base)
+            p[t1] += a * n1
+            p[t2] += b * n2
+            return (p[0], p[1], p[2])
+
+        quad = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)]
+        if sign == -1:
+            quad.reverse()
+
+        normal = [0.0, 0.0, 0.0]
+        normal[axis] = float(sign)
+
+        start = len(vertices)
+        vertices.extend(quad)
+        normals.extend([tuple(normal)] * 4)
+        indices.extend([start, start + 1, start + 2, start, start + 2, start + 3])
+        materials.append(rect["material"])
+
+    return {
+        "vertices": vertices,
+        "normals": normals,
+        "indices": indices,
+        "materials": materials,
+        "triangle_count": len(indices) // 3,
+    }
 
 
 def compute_ao(
@@ -162,7 +261,40 @@ def compute_ao(
     ``count = s1 + s2 + (0 if (s1 and s2) else c)``，返回
     ``1.0 - count / 3.0``。只算一两个邻接会漏掉角落遮挡，是不允许的。
     """
-    raise NotImplementedError
+
+    def solid(pos: tuple[int, int, int]) -> int:
+        return 1 if blocks.get(pos, 0) != 0 else 0
+
+    ao: list[float] = []
+    for face in faces:
+        x, y, z, axis, sign, _material = face
+        t1 = (axis + 1) % 3
+        t2 = (axis + 2) % 3
+
+        # 与 build_vertices 相同的顶点顺序（单位面 n1 == n2 == 1）。
+        corners = [(0, 0), (1, 0), (1, 1), (0, 1)]
+        if sign == -1:
+            corners.reverse()
+
+        for a, b in corners:
+            d1 = 1 if a else -1
+            d2 = 1 if b else -1
+            p1 = [x, y, z]
+            p1[axis] += sign
+            p1[t1] += d1
+            p2 = [x, y, z]
+            p2[axis] += sign
+            p2[t2] += d2
+            pc = [x, y, z]
+            pc[axis] += sign
+            pc[t1] += d1
+            pc[t2] += d2
+            s1 = solid((p1[0], p1[1], p1[2]))
+            s2 = solid((p2[0], p2[1], p2[2]))
+            c = solid((pc[0], pc[1], pc[2]))
+            count = s1 + s2 + (0 if (s1 and s2) else c)
+            ao.append(1.0 - count / 3.0)
+    return ao
 
 
 def stitch_borders(
@@ -186,7 +318,16 @@ def stitch_borders(
     同一坐标在多个区块中出现时：材质相同视为重复并去重；材质不同抛
     ``MeshError``。
     """
-    raise NotImplementedError
+    blocks: dict[tuple[int, int, int], int] = {}
+    for key in sorted(chunks, key=repr):
+        for pos, material in chunks[key].items():
+            existing = blocks.get(pos)
+            if existing is not None and existing != material:
+                raise MeshError(
+                    f"坐标 {pos} 在区块间冲突：{existing} != {material}"
+                )
+            blocks[pos] = material
+    return {"blocks": blocks, "faces": cull_hidden(blocks, {})}
 
 
 def assign_materials(
@@ -209,7 +350,16 @@ def assign_materials(
     非空气方块 id 不在 ``palette`` 中时抛 ``MeshError``；不允许用 ``-1``
     之类的哨兵值兜底。
     """
-    raise NotImplementedError
+    index_of = {block_id: i for i, block_id in enumerate(sorted(palette))}
+    result: dict[tuple[int, int, int], int] = {}
+    for pos in sorted(blocks):
+        block_id = blocks[pos]
+        if block_id == 0:
+            continue
+        if block_id not in index_of:
+            raise MeshError(f"未知方块 id：{block_id}（坐标 {pos}）")
+        result[pos] = index_of[block_id]
+    return result
 
 
 def estimate_triangles(faces: Iterable[Mapping[str, object]]) -> int:
@@ -227,7 +377,7 @@ def estimate_triangles(faces: Iterable[Mapping[str, object]]) -> int:
     不得按矩形的 ``area`` 或未合并的单位面数统计，否则合并后的数值会退回
     未合并规模，明显偏大。
     """
-    raise NotImplementedError
+    return 2 * len(list(faces))
 
 
 def mesh_batch(
@@ -259,4 +409,16 @@ def mesh_batch(
     不得只跳过非法区块或返回其余区块的部分结果。输出与区块键、字典插入
     顺序无关：同一场景两次调用必须完全相等。
     """
-    raise NotImplementedError
+    stitched = stitch_borders(chunks)
+    blocks = stitched["blocks"]
+    faces = stitched["faces"]
+    materials = assign_materials(blocks, palette)
+    rects: list[dict] = []
+    for axis in (0, 1, 2):
+        rects.extend(greedy_merge(faces, axis))
+    return {
+        "blocks": blocks,
+        "faces": faces,
+        "materials": materials,
+        "mesh": build_vertices(rects),
+    }
